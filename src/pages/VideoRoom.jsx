@@ -108,7 +108,18 @@ export default function VideoRoom({ setCurrentPage,role="patient",patientId,appo
 
   const initiateCall = (currentStream) => {
     console.log("Creating WebRTC peer...");
-    const peer = new Peer({ initiator: true, trickle: false, stream: currentStream });
+    const peer = new Peer({ 
+      initiator: true, 
+      trickle: false, 
+      stream: currentStream,
+      config:{
+        iceServers:[
+          {
+            urls:
+            'stun:stun.l.google.com:19302'
+          }
+        ]
+      } });
     peer.on('signal', (data) => {
       console.log("📧 Doctor sending offer");
       socketRef.current.emit('offer', { signal: data, roomId: ROOM_ID });
@@ -128,7 +139,17 @@ export default function VideoRoom({ setCurrentPage,role="patient",patientId,appo
 
   const handleReceiveCall = (incomingSignal, currentStream) => {
     setCallAccepted(true);
-    const peer = new Peer({ initiator: false, trickle: false, stream: currentStream });
+    const peer = new Peer({ 
+      initiator: false, 
+      trickle: false, 
+      stream: currentStream,
+      config:{
+        iceServers:[
+          { urls:
+            'stun:stun.google.com:19302'
+          }
+        ]
+      }});
 
     peer.on('signal', (data) => {
       socketRef.current.emit('answer', { signal: data, roomId: ROOM_ID });
@@ -214,7 +235,7 @@ const handleSubmitPrescription = async (e) => {
     }
 
     const response = await fetch(
-      'http://react-rural-telemedicine-app.onrender.com/api/prescriptions',
+      'https://react-rural-telemedicine-app.onrender.com/api/prescriptions',
       {
         method: 'POST',
         headers: {
@@ -267,7 +288,7 @@ const handleSubmitPrescription = async (e) => {
     }
 
     const response = await fetch(
-      `http://react-rural-telemedicine-app.onrender.com/api/appointments/${appointmentId}/status`,
+      `https://react-rural-telemedicine-app.onrender.com/api/appointments/${appointmentId}/status`,
       {
         method: "PATCH",
         headers: {
