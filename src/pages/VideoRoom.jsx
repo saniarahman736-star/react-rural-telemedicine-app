@@ -1,482 +1,381 @@
+// telemedicine-frontend/src/pages/VideoRoom.jsx
 import React, { useState, useEffect, useRef } from 'react';
-import Peer from 'simple-peer';
-import io from 'socket.io-client';
-import doctorPlaceholder from '../assets/images/doctor paceholder.jpg';
-import { PAGES } from '../constants/pages';
-import { useOfflineSync } from '../context/OfflineSyncContext';
-const SOCKET_SERVER_URL = 'https://react-rural-telemedicine-app.onrender.com'; 
-export default function VideoRoom({ setCurrentPage,role="patient",patientId,appointmentId}) {
-  const { isOnline, queueAction, pendingCount } = useOfflineSync();
-  const [isMuted, setIsMuted] = useState(false);
-  const [isVideoOff, setIsVideoOff] = useState(false);
-  const [isSpeakerOn, setIsSpeakerOn] = useState(true);
-  const [isChatVisible, setIsChatVisible] = useState(true);
-  const [activeTab, setActiveTab] = useState(role=== "doctor" ? 'prescription':'chat'); 
-  const [liveSpokenText, setLiveSpokenText] = useState('Listening to translated speech output...');
-  const [stream, setStream] = useState(null);
-  const [callAccepted, setCallAccepted] = useState(false);
-  const [latency, setLatency] = useState(0);
-  const [bandwidthMode, setBandwidthMode] = useState('video');
-  const myVideo = useRef();
-  const userVideo = useRef();
-  const connectionRef = useRef();
+import { io } from 'socket.io-client';
+
+// Enhanced WebRTC ICE Configuration featuring free Open Relay TURN servers
+// Configured across UDP, TCP (Port 80/443), and TLS to bypass strict firewalls
+const ICE_SERVERS = {
+  iceServers: [
+    // Standard Free Public STUN Servers
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:openrelay.metered.ca:80' },
+
+    // Free Public TURN Relay Servers (OpenRelay Project by Metered)
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ],
+  iceCandidatePoolSize: 10
+};
+
+// Replace with your Render Backend URL from .env or default to Render address
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'https://react-rural-telemed.onrender.com';
+
+export default function VideoRoom({ setCurrentPage, roomId = 'consultation-room-1', userRole = 'doctor' }) {
+  const [isVideoOn, setIsVideoOn] = useState(true);
+  const [isMicOn, setIsMicOn] = useState(true);
+  const [activePanel, setActivePanel] = useState('notes');
+  const [isConnected, setIsConnected] = useState(false);
+
+  // References for Media and Connection
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const localStreamRef = useRef(null);
+  const peerConnectionRef = useRef(null);
   const socketRef = useRef(null);
-  const pingIntervalRef = useRef(null);
-  const ROOM_ID = appointmentId
-        ? `appointment_${appointmentId}`
-        : "appointment_unknown";
+  const chatEndRef = useRef(null);
+
+  // Mock Patient Data
+  const patient = {
+    id: 'P-9482',
+    name: 'Ananya Sharma',
+    age: 34,
+    gender: 'Female',
+    condition: 'Acute Bronchitis / Asthmatic Flare-up',
+    vitals: { bp: '128/82 mmHg', hr: '94 bpm', spo2: '96%', temp: '99.2 °F' },
+    allergies: ['Penicillin', 'Sulfonamides']
+  };
+
   const [messages, setMessages] = useState([
-    { sender: 'System', text: 'Secure consultation room active. Audio stream translated live.' }
+    { sender: 'system', text: 'Room connected. Waiting for peer...', time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }
   ]);
   const [inputMessage, setInputMessage] = useState('');
-  
-  const [prescriptionData, setPrescriptionData] = useState({
-    disease: '', diagnosis: '', medicines: '', treatment: '',
-    suggestions: '', next_steps: '', notes: ''
-  });
-  const [submitting, setSubmitting] = useState(false);
-  const [formMessage, setFormMessage] = useState({ type: '', text: '' });
+  const [clinicalNotes, setClinicalNotes] = useState(
+    'Chief Complaint: Acute chest tightness and dry cough.\nAssessment: Mild asthmatic flare-up triggered by seasonal dust.\nPlan: Prescribe bronchodilator inhaler and monitor vitals for 48 hours.'
+  );
 
   useEffect(() => {
-    // 1. Get Local Media Stream
-    navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-      .then((currentStream) => {
-        setStream(currentStream);
-        if (myVideo.current) {
-          myVideo.current.srcObject = currentStream;
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  useEffect(() => {
+    // 1. Initialize Socket Connection
+    socketRef.current = io(BACKEND_URL, { transports: ['websocket'] });
+
+    // 2. Initialize Camera and Microphone
+    async function setupMediaDevices() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localStreamRef.current = stream;
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = stream;
         }
-        // 2. Initialize Socket.io Connection after getting camera
-        initializeSocket(currentStream);
-      })
-      .catch(err => console.error("Failed to access media devices", err));
+
+        // 3. Join Signaling Room
+        socketRef.current.emit('join-room', { roomId, role: userRole });
+      } catch (err) {
+        console.error('Error accessing camera/microphone:', err);
+        alert('Could not access camera/microphone. Please ensure permissions are granted and HTTPS/localhost is used.');
+      }
+    }
+
+    setupMediaDevices();
+
+    // 4. Socket Listeners for WebRTC Signaling
+    socketRef.current.on('user-connected', async ({ socketId }) => {
+      console.log('Peer connected:', socketId);
+      setIsConnected(true);
+      createPeerConnection(socketId, true);
+    });
+
+    socketRef.current.on('signal', async ({ sender, signal }) => {
+      if (!peerConnectionRef.current) {
+        createPeerConnection(sender, false);
+      }
+
+      const pc = peerConnectionRef.current;
+      try {
+        if (signal.sdp) {
+          await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+          if (signal.sdp.type === 'offer') {
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socketRef.current.emit('signal', { target: sender, signal: { sdp: pc.localDescription } });
+          }
+        } else if (signal.candidate) {
+          await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+        }
+      } catch (err) {
+        console.error('Error handling WebRTC signal:', err);
+      }
+    });
+
+    socketRef.current.on('receive-message', (data) => {
+      setMessages(prev => [...prev, data]);
+    });
+
+    socketRef.current.on('user-disconnected', () => {
+      setIsConnected(false);
+      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.close();
+        peerConnectionRef.current = null;
+      }
+    });
 
     return () => {
-      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
-      if (socketRef.current) socketRef.current.disconnect();
-      if (stream) stream.getTracks().forEach(track => track.stop());
+      localStreamRef.current?.getTracks().forEach(track => track.stop());
+      peerConnectionRef.current?.close();
+      socketRef.current?.disconnect();
     };
-  }, []);
+  }, [roomId, userRole]);
 
-  const initializeSocket = (currentStream) => {
-    socketRef.current = io(SOCKET_SERVER_URL);
+  // Create WebRTC Peer Connection
+  const createPeerConnection = (targetSocketId, isInitiator) => {
+    const pc = new RTCPeerConnection(ICE_SERVERS);
+    peerConnectionRef.current = pc;
 
-    socketRef.current.on('connect', () => {
-      console.log('Connected to signaling server via Socket.io');
-      const userId=role==="doctor"?"Doctor_ID":"Patient_ID";
-      socketRef.current.emit('join-room', ROOM_ID,userId,role);
+    // Add Local Tracks to Peer Connection
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => {
+        pc.addTrack(track, localStreamRef.current);
+      });
+    }
 
-      // Ping for latency
-      pingIntervalRef.current = setInterval(() => {
-        socketRef.current.emit('ping-check', { latency: latency });
-      }, 2000);
-    });
-
-    socketRef.current.on('offer', (data) => {
-      console.log('Patient joined, receiving offer...');
-      if(role === "patient"){
-      handleReceiveCall(data.signal, currentStream);
+    // Handle Remote Track Received
+    pc.ontrack = (event) => {
+      if (remoteVideoRef.current && event.streams[0]) {
+        remoteVideoRef.current.srcObject = event.streams[0];
       }
-    });
-    socketRef.current.on('answer', (data) => {
-      if (connectionRef.current) {
-        connectionRef.current.signal(data.signal);
+    };
+
+    // Send ICE Candidates via Signaling Server
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        socketRef.current.emit('signal', {
+          target: targetSocketId,
+          signal: { candidate: event.candidate }
+        });
       }
-    });
+    };
 
-    socketRef.current.on('fallback-instruction', (data) => {
-      console.warn(`Bandwidth shift: ${data.mode} - ${data.message}`);
-      setBandwidthMode(data.mode);
-      if (data.mode === 'audio-only' && currentStream) {
-        currentStream.getVideoTracks()[0].enabled = false;
-        setIsVideoOff(true);
+    // Monitor Connection State
+    pc.oniceconnectionstatechange = () => {
+      console.log('ICE Connection State:', pc.iceConnectionState);
+      if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+        setIsConnected(false);
+      } else if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        setIsConnected(true);
       }
-    });
-    socketRef.current.on('patient-connected', () => {
-      console.log('Patient joined, initiating WebRTC call...');
-      if(role==="doctor"){
-        console.log("Doctor initiating ebRTC call...");
-      initiateCall(currentStream);
-      }
-    });
-    socketRef.current.on('user-disconnected', () => {
-      handleEndCall(false);
-    });
-    socketRef.current.on('call-ended', () => {
-      handleEndCall(false);
-    });
-  };
+    };
 
-  const initiateCall = (currentStream) => {
-    console.log("Creating WebRTC peer...");
-    const peer = new Peer({ 
-      initiator: true, 
-      trickle: false, 
-      stream: currentStream,
-      config:{
-        iceServers:[
-          {
-            urls:
-            'stun:stun.l.google.com:19302'
-          }
-        ]
-      } });
-    peer.on('signal', (data) => {
-      console.log("📧 Doctor sending offer");
-      socketRef.current.emit('offer', { signal: data, roomId: ROOM_ID });
-    });
-    peer.on('stream', (remoteStream) => {
-      console.log("Doctor received patient video");
-      if (userVideo.current){
-         userVideo.current.srcObject = remoteStream;
-      }
-      setCallAccepted(true);
-    });
-    peer.on("error",(err)=>{
-      console.error("Doctor WebRTC error:",err);
-    });
-    connectionRef.current = peer;
-  };
-
-  const handleReceiveCall = (incomingSignal, currentStream) => {
-    setCallAccepted(true);
-    const peer = new Peer({ 
-      initiator: false, 
-      trickle: false, 
-      stream: currentStream,
-      config:{
-        iceServers:[
-          { urls:
-            'stun:stun.google.com:19302'
-          }
-        ]
-      }});
-
-    peer.on('signal', (data) => {
-      socketRef.current.emit('answer', { signal: data, roomId: ROOM_ID });
-    });
-
-    peer.on('stream', (remoteStream) => {
-      if (userVideo.current) userVideo.current.srcObject = remoteStream;
-    });
-
-    peer.signal(incomingSignal);
-    connectionRef.current = peer;
-  };
-
-  // --- UI Handlers ---
-
-  const toggleMute = () => {
-    if (stream) {
-      stream.getAudioTracks()[0].enabled = !stream.getAudioTracks()[0].enabled;
-      setIsMuted(!stream.getAudioTracks()[0].enabled);
+    // If caller, create SDP Offer
+    if (isInitiator) {
+      pc.createOffer().then(offer => {
+        pc.setLocalDescription(offer);
+        socketRef.current.emit('signal', {
+          target: targetSocketId,
+          signal: { sdp: offer }
+        });
+      }).catch(err => console.error('Error creating SDP Offer:', err));
     }
   };
 
+  // Toggle Mute Audio
+  const toggleMic = () => {
+    if (localStreamRef.current) {
+      const audioTrack = localStreamRef.current.getAudioTracks()[0];
+      if (audioTrack) {
+        audioTrack.enabled = !audioTrack.enabled;
+        setIsMicOn(audioTrack.enabled);
+      }
+    }
+  };
+
+  // Toggle Video On/Off
   const toggleVideo = () => {
-    if (stream) {
-      stream.getVideoTracks()[0].enabled = !stream.getVideoTracks()[0].enabled;
-      setIsVideoOff(!stream.getVideoTracks()[0].enabled);
+    if (localStreamRef.current) {
+      const videoTrack = localStreamRef.current.getVideoTracks()[0];
+      if (videoTrack) {
+        videoTrack.enabled = !videoTrack.enabled;
+        setIsVideoOn(videoTrack.enabled);
+      }
     }
   };
 
+  // Chat Submission
   const handleSendMessage = (e) => {
     e.preventDefault();
     if (!inputMessage.trim()) return;
-    setMessages((prev) => [...prev, { sender: 'You (Doctor)', text: inputMessage }]);
+
+    const msgData = {
+      sender: userRole,
+      text: inputMessage,
+      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    };
+
+    socketRef.current.emit('send-message', msgData);
     setInputMessage('');
-    setTimeout(() => {
-      setMessages((prev) => [...prev, { sender: 'Patient', text: 'Thank you, doctor.' }]);
-    }, 1000);
   };
 
-  const handlePrescriptionChange = (e) => {
-    setPrescriptionData({ ...prescriptionData, [e.target.name]: e.target.value });
-  };
-const handleSubmitPrescription = async (e) => {
-  e.preventDefault();
-
-  setSubmitting(true);
-  setFormMessage({ type: '', text: '' });
-
-  const payload = {
-    ...prescriptionData,
-    patient_id: patientId,
-    appointment_id:appointmentId,
-  };
-
-  console.log("========== PRESCRIPTION DEBUG ==========");
-  console.log("patientId:", patientId);
-  console.log("prescriptionData:", prescriptionData);
-  console.log("payload:", payload);
-  console.log("========================================");
-
-  if (!isOnline) {
-    queueAction({
-      type: 'prescription',
-      payload
-    });
-
-    setFormMessage({
-      type: 'success',
-      text: '📥 Offline: Prescription saved locally. It will sync automatically once your connection returns.'
-    });
-
-    setSubmitting(false);
-
-    setTimeout(() => handleEndCall(true), 2000);
-    return;
-  }
-
-  try {
-    const token = localStorage.getItem('token');
-
-    if (!token) {
-      throw new Error('Authentication token not found');
-    }
-
-    const response = await fetch(
-      'https://react-rural-telemedicine-app.onrender.com/api/prescriptions',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify(payload),
-      }
-    );
-
-    const data = await response.json().catch(() => ({}));
-
-    console.log("Prescription status:", response.status);
-    console.log("Prescription response:", data);
-
-    if (!response.ok) {
-      throw new Error(
-        data.error || `Prescription request failed (${response.status})`
-      );
-    }
-    await markAppointmentCompleted();
-    setFormMessage({
-      type: 'success',
-      text: 'Prescription saved! Appointment completed.'
-    });
-
-    setTimeout(() => handleEndCall(true), 2000);
-
-  } catch (error) {
-    console.error("Prescription save error:", error);
-
-    setFormMessage({
-      type: 'error',
-      text: error.message || 'Error saving prescription.'
-    });
-
-  } finally {
-    setSubmitting(false);
-  }
-};
-  const markAppointmentCompleted = async () => {
-  if (!appointmentId || role !== "doctor") return;
-
-  try {
-    const token = localStorage.getItem("token");
-
-    if (!token) {
-      console.error("Authentication token not found");
-      return;
-    }
-
-    const response = await fetch(
-      `https://react-rural-telemedicine-app.onrender.com/api/appointments/${appointmentId}/status`,
-      {
-        method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          status: "completed",
-        }),
-      }
-    );
-
-    const data = await response.json().catch(() => ({}));
-
-    console.log("Appointment completed:", data);
-
-    if (!response.ok) {
-      console.error(
-        data.error || "Could not mark appointment as completed"
-      );
-    }
-  } catch (error) {
-    console.error("Error completing appointment:", error);
-  }
-};
-
-  const handleEndCall =async (navigateAway = true) => {
-    if (socketRef.current && socketRef.current.connected) {
-      socketRef.current.emit('end-call', { roomId: ROOM_ID });
-    }
-    if (pingIntervalRef.current) {
-      clearInterval(pingIntervalRef.current);
-    }
-    if (connectionRef.current) connectionRef.current.destroy();
-    if (stream) stream.getTracks().forEach(track => track.stop());
-    if (navigateAway && setCurrentPage) {
-      setCurrentPage(role === "doctor" ? "doctor-dashboard":"dashboard");
-  }
-  };
-  const simulateSpeechTranslation = () => {
-    setLiveSpokenText('🗣️ [Live Translated Voice]: "Please take deep breaths and describe your chest comfort."');
+  const endCall = () => {
+    localStreamRef.current?.getTracks().forEach(track => track.stop());
+    peerConnectionRef.current?.close();
+    socketRef.current?.disconnect();
+    if (setCurrentPage) setCurrentPage('dashboard');
   };
 
   return (
-    <div className="flex flex-col h-[calc(100vh-64px)] bg-gray-900 text-white p-4">
-      <div className="mb-4 flex justify-between items-center">
-        <div className="flex items-center space-x-3">
-          <img src={doctorPlaceholder} alt="Doctor Profile" className="w-10 h-10 rounded-full object-cover border-2 border-green-500 shadow-sm animate-pulse" />
-          <div>
-            <h2 className="text-lg font-bold text-green-400">Live Consultation Workspace</h2>
-            <p className="text-xs text-gray-400 flex items-center gap-2">
-                Secure end-to-end encrypted connection
-                {latency > 0 && <span className={`px-2 py-0.5 rounded text-[10px] ${latency < 200 ? 'bg-green-900 text-green-300' : latency < 1000 ? 'bg-yellow-900 text-yellow-300' : 'bg-red-900 text-red-300'}`}>Ping: {latency}ms</span>}
-                {!isOnline && <span className="px-2 py-0.5 rounded text-[10px] bg-orange-900 text-orange-300 font-bold">📴 Offline</span>}
-                {pendingCount > 0 && <span className="px-2 py-0.5 rounded text-[10px] bg-blue-900 text-blue-300 font-bold">📥 {pendingCount} pending sync</span>}
-            </p>
-          </div>
-        </div>
-
-        <div className="flex items-center space-x-3">
-          <button onClick={() => setIsChatVisible(!isChatVisible)} className="bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-600 px-3 py-2 rounded text-sm font-semibold transition-transform transform active:scale-95 shadow-md">
-            {isChatVisible ? 'Hide Panel 📝' : 'Show Panel 📝'}
-          </button>
-          <button onClick={() => handleEndCall(true)} className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded text-sm font-semibold transition-transform transform active:scale-95 shadow-md">
-            End Call
-          </button>
-        </div>
-      </div>
-      
-      <div className={`flex-1 grid grid-cols-1 ${isChatVisible ? 'md:grid-cols-3' : 'grid-cols-1'} gap-4 pb-4 transition-all duration-300 h-full overflow-hidden`}>
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
+      <div className="flex-1 flex flex-col lg:flex-row h-screen overflow-hidden">
         
-        {/* Video Feed Area */}
-        <div className={`${isChatVisible ? 'md:col-span-2' : 'col-span-1'} bg-black rounded-lg flex flex-col items-center justify-center relative border border-gray-700 shadow-inner overflow-hidden`}>
-          
-          <video playsInline ref={userVideo} autoPlay className="w-full h-full object-cover absolute inset-0 z-0" />
-          
-          {(!callAccepted || bandwidthMode === 'audio-only') && (
-            <div className="flex flex-col items-center justify-center space-y-2 z-10 absolute inset-0 bg-black/80">
-              <div className={`w-24 h-24 rounded-full border-2 flex items-center justify-center ${bandwidthMode === 'audio-only' ? 'bg-yellow-900/40 border-yellow-500' : 'bg-green-900/40 border-green-500 animate-bounce'}`}>
-                <span className="text-3xl">{bandwidthMode === 'audio-only' ? '🔉' : '👤'}</span>
+        {/* Main Video Viewport */}
+        <div className="flex-1 flex flex-col bg-slate-900 border-r border-slate-800 relative">
+          <div className="absolute top-4 left-4 z-10 flex items-center gap-3 bg-slate-950/80 backdrop-blur-md px-4 py-2 rounded-2xl border border-slate-800 shadow-lg">
+            <span className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`}></span>
+            <span className="text-xs font-bold text-white">{patient.name}</span>
+            <span className="text-xs text-slate-400 border-l border-slate-700 pl-3">
+              {isConnected ? 'Connected' : 'Waiting for Peer...'}
+            </span>
+          </div>
+
+          <div className="flex-1 flex items-center justify-center p-4 sm:p-6 relative">
+            <div className="w-full h-full max-h-[75vh] bg-slate-950 rounded-3xl border border-slate-800 relative overflow-hidden flex items-center justify-center shadow-2xl">
+              
+              {/* Remote Video Stream */}
+              <video
+                ref={remoteVideoRef}
+                autoPlay
+                playsInline
+                className="w-full h-full object-cover"
+              />
+
+              {/* Local Self-View Stream Overlay */}
+              <div className="absolute bottom-6 right-6 w-36 sm:w-48 h-24 sm:h-32 bg-slate-900 rounded-2xl border border-slate-700 shadow-2xl overflow-hidden flex items-center justify-center">
+                <video
+                  ref={localVideoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  className={`w-full h-full object-cover ${!isVideoOn && 'hidden'}`}
+                />
+                {!isVideoOn && <span className="text-[10px] text-slate-500 font-bold">Camera Off</span>}
               </div>
-              <p className={`font-semibold text-sm ${bandwidthMode === 'audio-only' ? 'text-yellow-400' : 'text-gray-400'}`}>
-                  {bandwidthMode === 'audio-only' ? 'Audio-Only Mode Active (Low Bandwidth)' : role === "doctor" ?'Waiting for patient connection...':'Waiting for doctor to join...'}
-              </p>
             </div>
-          )}
-
-          <div className="absolute bottom-4 left-4 w-40 h-32 bg-gray-800 border-2 border-gray-600 rounded-lg overflow-hidden z-20 shadow-lg">
-             {isVideoOff ? (
-                 <div className="w-full h-full flex items-center justify-center bg-gray-900 text-red-500">📷🚫</div>
-             ) : (
-                 <video playsInline muted ref={myVideo} autoPlay className="w-full h-full object-cover transform scale-x-[-1]" />
-             )}
           </div>
 
-          <div className="absolute top-4 bg-black/70 backdrop-blur px-4 py-2 rounded-lg border border-green-500/50 text-xs text-green-300 font-medium max-w-md text-center cursor-pointer z-20" onClick={simulateSpeechTranslation}>
-            {liveSpokenText} <span className="text-[10px] text-gray-400 block underline">(Click to simulate translated speaker audio)</span>
-          </div>
+          {/* Call Controls */}
+          <div className="h-20 bg-slate-950/90 backdrop-blur-md border-t border-slate-800 px-6 flex items-center justify-between z-10">
+            <div className="flex items-center gap-3">
+              <button 
+                onClick={toggleMic}
+                className={`w-12 h-12 rounded-2xl flex items-center justify-center transition-all cursor-pointer ${
+                  isMicOn ? 'bg-slate-800 hover:bg-slate-700 text-white' : 'bg-rose-600 text-white shadow-lg'
+                }`}
+              >
+                {isMicOn ? (
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"/></svg>
+                ) : (
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><line x1="1" y1="1" x2="23" y2="23"/><path strokeLinecap="round" strokeLinejoin="round" d="M9 9v3a3 3 0 005.12 2.12M15 9.34V4a3 3 0 10-5.94-.6M17 16.95A7 7 0 015 11v-1m14 1v1a7 7 0 01-.36 2.15M12 19v4m-4 0h8"/></svg>
+                )}
+              </button>
 
-          <div className="absolute bottom-4 right-4 flex space-x-2 bg-gray-900/90 backdrop-blur p-2 rounded-lg border border-gray-700 shadow-xl z-20">
-            <button onClick={toggleMute} className={`p-2 rounded text-xs font-bold transition-transform transform active:scale-95 ${isMuted ? 'bg-red-600 text-white animate-pulse' : 'bg-gray-700 text-gray-200 hover:bg-gray-600'}`}>
-              {isMuted ? '🔇 Muted' : '🎤 Mute'}
-            </button>
-            <button onClick={toggleVideo} className={`p-2 rounded text-xs font-bold transition-transform transform active:scale-95 ${isVideoOff ? 'bg-red-600 text-white' : 'bg-gray-700 text-gray-200 hover:bg-gray-600'}`}>
-              {isVideoOff ? '📷 Video Off' : '📹 Video On'}
+              <button 
+                onClick={toggleVideo}
+                className={`w-12 h-12 rounded-2xl flex items-center justify-center transition-all cursor-pointer ${
+                  isVideoOn ? 'bg-slate-800 hover:bg-slate-700 text-white' : 'bg-rose-600 text-white shadow-lg'
+                }`}
+              >
+                {isVideoOn ? (
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+                ) : (
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M16 16v1a2 2 0 01-2 2H3a2 2 0 01-2-2V7a2 2 0 012-2h2m5.66 2H14a2 2 0 012 2v3.34l1.553-1.276A1 1 0 0119 12.618v2.764m-4-6.382L4 16m15-10l-4 4"/></svg>
+                )}
+              </button>
+            </div>
+
+            <button 
+              onClick={endCall}
+              className="flex items-center gap-2 px-6 h-12 rounded-2xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs shadow-lg transition-all cursor-pointer"
+            >
+              <span>End Consultation</span>
             </button>
           </div>
         </div>
-        
-        {/* Sidebar Panel */}
-        {isChatVisible && (
-          <div className="bg-gray-800 rounded-lg p-4 flex flex-col border border-gray-700 shadow-lg h-full overflow-hidden">
-            <div className="flex border-b border-gray-700 pb-2 mb-3 space-x-2 shrink-0">
-              {role === "doctor" && (<button onClick={() => setActiveTab('prescription')} className={`flex-1 py-1.5 text-xs font-bold rounded transition-all transform active:scale-95 ${activeTab === 'prescription' ? 'bg-blue-600 text-white shadow' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}>
-                📝 E-Prescription
-              </button>
-              )}
-              <button onClick={() => setActiveTab('chat')} className={`flex-1 py-1.5 text-xs font-bold rounded transition-all transform active:scale-95 ${activeTab === 'chat' ? 'bg-green-600 text-white shadow' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}>
-                💬 Live Chat
-              </button>
-            </div>
 
-            {/* CHAT TAB */}
-            {activeTab === 'chat' && (
-              <div className="flex-1 flex flex-col justify-between overflow-hidden">
-                <div className="flex-1 overflow-y-auto space-y-3 pr-1 text-sm">
+        {/* Control Sidebar */}
+        <div className="w-full lg:w-[420px] bg-slate-900 flex flex-col border-t lg:border-t-0 border-slate-800">
+          <div className="grid grid-cols-3 p-2 bg-slate-950 border-b border-slate-800 gap-1">
+            <button onClick={() => setActivePanel('notes')} className={`py-2 px-2 rounded-xl text-xs font-bold cursor-pointer ${activePanel === 'notes' ? 'bg-blue-600 text-white' : 'text-slate-400'}`}>Notes</button>
+            <button onClick={() => setActivePanel('chat')} className={`py-2 px-2 rounded-xl text-xs font-bold cursor-pointer ${activePanel === 'chat' ? 'bg-blue-600 text-white' : 'text-slate-400'}`}>Chat</button>
+            <button onClick={() => setActivePanel('records')} className={`py-2 px-2 rounded-xl text-xs font-bold cursor-pointer ${activePanel === 'records' ? 'bg-blue-600 text-white' : 'text-slate-400'}`}>Vitals</button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
+            {activePanel === 'notes' && (
+              <textarea 
+                value={clinicalNotes}
+                onChange={(e) => setClinicalNotes(e.target.value)}
+                className="w-full h-48 bg-slate-950 border border-slate-800 rounded-2xl p-3 text-xs text-slate-200 focus:outline-none font-mono"
+              />
+            )}
+
+            {activePanel === 'records' && (
+              <div className="space-y-3">
+                <div className="p-3 bg-slate-950 rounded-2xl border border-slate-800">
+                  <h4 className="text-xs font-bold text-slate-400 mb-2">Patient Vitals</h4>
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <div><span className="text-slate-500">BP:</span> {patient.vitals.bp}</div>
+                    <div><span className="text-slate-500">HR:</span> {patient.vitals.hr}</div>
+                    <div><span className="text-slate-500">SpO2:</span> {patient.spo2 || patient.vitals.spo2}</div>
+                    <div><span className="text-slate-500">Temp:</span> {patient.vitals.temp}</div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activePanel === 'chat' && (
+              <div className="flex flex-col flex-1 h-[400px]">
+                <div className="flex-1 overflow-y-auto space-y-3 pr-2 mb-3">
                   {messages.map((msg, index) => (
-                    <div key={index} className={`p-3 rounded-lg ${msg.sender === 'You (Doctor)' ? 'bg-green-900/50 border border-green-700 ml-4' : 'bg-gray-700 mr-4'}`}>
-                      <p className="text-xs font-bold text-green-400 mb-1">{msg.sender}</p>
-                      <p className="text-gray-200">{msg.text}</p>
+                    <div key={index} className={`flex flex-col ${msg.sender === userRole ? 'items-end' : 'items-start'}`}>
+                      <div className={`max-w-[85%] p-3 rounded-2xl text-xs ${msg.sender === userRole ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-200'}`}>
+                        {msg.text}
+                      </div>
+                      <span className="text-[10px] text-slate-500 mt-1">{msg.time}</span>
                     </div>
                   ))}
+                  <div ref={chatEndRef} />
                 </div>
-                <form onSubmit={handleSendMessage} className="mt-3 pt-3 border-t border-gray-700 flex gap-2 shrink-0">
-                  <input type="text" value={inputMessage} onChange={(e) => setInputMessage(e.target.value)} placeholder="Type message or translated text..." className="flex-1 bg-gray-700 border border-gray-600 rounded p-2 text-sm focus:outline-none focus:border-green-500 text-white" />
-                  <button type="submit" className="bg-green-600 hover:bg-green-700 px-3 py-2 rounded font-bold text-sm transition-transform transform active:scale-95 shadow">Send</button>
+                <form onSubmit={handleSendMessage} className="flex items-center gap-2">
+                  <input 
+                    type="text"
+                    value={inputMessage}
+                    onChange={(e) => setInputMessage(e.target.value)}
+                    placeholder="Type message..."
+                    className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-xs text-white"
+                  />
+                  <button type="submit" className="w-10 h-10 bg-blue-600 text-white rounded-xl">Send</button>
                 </form>
-              </div>
-            )}
-            {role === "doctor" && activeTab === 'prescription' && (
-              <div className="flex-1 flex flex-col overflow-hidden">
-                {formMessage.text && (
-                  <div className={`p-2 mb-3 rounded text-xs font-bold text-center shrink-0 ${formMessage.type === 'error' ? 'bg-red-900/50 text-red-300 border border-red-700' : 'bg-green-900/50 text-green-300 border border-green-700'}`}>{formMessage.text}</div>
-                )}
-                <form id="prescription-form" onSubmit={handleSubmitPrescription} className="flex-1 overflow-y-auto space-y-3 pr-1 pb-2">
-                  <div className="grid grid-cols-2 gap-2">
-                    <div>
-                      <label className="block text-[10px] font-bold text-gray-400 uppercase mb-1">Disease</label>
-                      <input type="text" name="disease" value={prescriptionData.disease} onChange={handlePrescriptionChange} placeholder="e.g. Viral Fever" className="w-full p-2 bg-gray-700 border border-gray-600 rounded text-xs text-white focus:outline-none focus:border-blue-500" required />
-                    </div>
-                    <div>
-                      <label className="block text-[10px] font-bold text-gray-400 uppercase mb-1">Diagnosis</label>
-                      <input type="text" name="diagnosis" value={prescriptionData.diagnosis} onChange={handlePrescriptionChange} placeholder="Diagnosis" className="w-full p-2 bg-gray-700 border border-gray-600 rounded text-xs text-white focus:outline-none focus:border-blue-500" />
-                    </div>
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-bold text-gray-400 uppercase mb-1">Prescribed Medicines 💊</label>
-                    <textarea name="medicines" value={prescriptionData.medicines} onChange={handlePrescriptionChange} rows="3" placeholder="1. Paracetamol 650mg - 1-0-1" className="w-full p-2 bg-gray-700 border border-gray-600 rounded text-xs text-white font-mono focus:outline-none focus:border-blue-500" required></textarea>
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-bold text-gray-400 uppercase mb-1">Treatment Plan</label>
-                    <textarea name="treatment" value={prescriptionData.treatment} onChange={handlePrescriptionChange} rows="2" placeholder="Drink plenty of fluids." className="w-full p-2 bg-gray-700 border border-gray-600 rounded text-xs text-white focus:outline-none focus:border-blue-500"></textarea>
-                  </div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <div>
-                      <label className="block text-[10px] font-bold text-gray-400 uppercase mb-1">Suggestions</label>
-                      <input type="text" name="suggestions" value={prescriptionData.suggestions} onChange={handlePrescriptionChange} className="w-full p-2 bg-gray-700 border border-gray-600 rounded text-xs text-white focus:outline-none focus:border-blue-500" />
-                    </div>
-                    <div>
-                      <label className="block text-[10px] font-bold text-gray-400 uppercase mb-1">Next Steps</label>
-                      <input type="text" name="next_steps" value={prescriptionData.next_steps} onChange={handlePrescriptionChange} className="w-full p-2 bg-gray-700 border border-gray-600 rounded text-xs text-white focus:outline-none focus:border-blue-500" />
-                    </div>
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-bold text-gray-400 uppercase mb-1">Internal Notes</label>
-                    <input type="text" name="notes" value={prescriptionData.notes} onChange={handlePrescriptionChange} className="w-full p-2 bg-gray-900 border border-gray-700 rounded text-xs text-gray-300 focus:outline-none focus:border-blue-500" />
-                  </div>
-                </form>
-                <div className="pt-3 border-t border-gray-700 shrink-0">
-                  <button type="submit" form="prescription-form" disabled={submitting} className="w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded text-sm font-bold transition-transform transform active:scale-95 shadow disabled:opacity-50">
-                    {submitting ? 'Submitting...' : 'Sign & Submit Prescription ✓'}
-                  </button>
-                </div>
               </div>
             )}
           </div>
-        )}
+        </div>
+
       </div>
     </div>
   );
-  }
+}
